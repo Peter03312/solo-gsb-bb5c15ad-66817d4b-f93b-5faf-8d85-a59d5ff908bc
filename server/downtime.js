@@ -12,6 +12,8 @@
 
 const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
 
+const { normTime } = require('./timeutil');
+
 class DowntimeError extends Error {
   constructor(code, message, details, conflicts) {
     super(message);
@@ -20,11 +22,6 @@ class DowntimeError extends Error {
     this.details = details || [];
     this.conflicts = conflicts || [];
   }
-}
-
-// 统一为含秒的形式再按字符串比较（事件时间与窗口时间均为本地 ISO 串，同构可比）。
-function normTime(t) {
-  return String(t).length === 16 ? `${t}:00` : String(t);
 }
 
 // ---------- 请求体规范化（设备/起止/原因/操作人） ----------

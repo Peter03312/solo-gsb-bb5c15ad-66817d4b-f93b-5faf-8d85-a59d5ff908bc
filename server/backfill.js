@@ -21,6 +21,7 @@
 const crypto = require('crypto');
 const { validateAll } = require('./validation');
 const { recompute } = require('./recompute');
+const { normTime, instantBefore } = require('./timeutil');
 
 const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
 
@@ -450,8 +451,11 @@ function resolveReferences(db, records, knownExternalRefs) {
         const refSeq = producedInPackage.get(batchCode);
         if (refSeq >= rec.seq) {
           errors.push(`${where}：包内引用只可指向有序记录中更早产出的批次 "${batchCode}"（记录 #${refSeq} 不在本条之前）`);
-        } else if (records[refSeq].event_time >= rec.event_time) {
-          errors.push(`${where}：引用的包内批次 "${batchCode}" 产出时间 ${records[refSeq].event_time} 不早于本条 ${rec.event_time}`);
+        } else if (!instantBefore(records[refSeq].event_time, rec.event_time)) {
+          // 实际时刻比较：分钟写法与带秒写法同刻即视为“不严格更早”（拒绝）。
+          errors.push(`${where}：引用的包内批次 "${batchCode}" 产出时间 ${records[refSeq].event_time} 不严格早于本条 ${rec.event_time}` +
+            (normTime(records[refSeq].event_time) === normTime(rec.event_time)
+              ? '（两时间为同一实际时刻：引用批次必须严格更早产出）' : ''));
         }
       } else if (!existingBatchByCode.has(batchCode)) {
         errors.push(`${where}：引用批次 "${batchCode}" 既不在补录包内、也不在既有时间线中（未知对象）`);

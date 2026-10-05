@@ -3,14 +3,19 @@
 // 返回错误信息数组（中文），为空表示通过。校验失败时调用方回滚整次提交。
 
 const { collectWindowConflicts } = require('./downtime');
+const { normTime } = require('./timeutil');
 
 function validateAll(db) {
   const errors = [];
 
+  // 按“实际时刻”排序：分钟写法（09:00）与带秒写法（09:00:00）视为同一刻，
+  // 不能直接按 event_time 字符串排序（否则两种写法的同刻记录会被错置先后）。
   const events = db.prepare(
     `SELECT id, event_time, type, equipment_id, batch_id
        FROM events ORDER BY event_time, id`
-  ).all();
+  ).all()
+    .map((e) => ({ ...e, _t: normTime(e.event_time) }))
+    .sort((a, b) => (a._t < b._t ? -1 : a._t > b._t ? 1 : a.id - b.id));
 
   // 1. PROCESS 必须挂批次，且同一批次只能由一次加工产出
   const batchProducer = new Map();
@@ -29,25 +34,29 @@ function validateAll(db) {
     }
   }
 
-  // 2. 同一设备事件时间冲突（同一设备不允许同一时刻多条事件）
+  // 2. 同一设备事件时间冲突（同一设备不允许同一时刻多条事件）。
+  //    “同一时刻”按实际时刻判定：分钟写法 09:00 与带秒写法 09:00:00 同刻即冲突，
+  //    不能按原始文本判重，否则两种写法的同刻事件会被同时接受。
   const slot = new Set();
   for (const e of events) {
-    const key = `${e.equipment_id}|${e.event_time}`;
+    const key = `${e.equipment_id}|${e._t}`;
     if (slot.has(key)) {
       errors.push(
-        `设备 #${e.equipment_id} 在 ${e.event_time} 存在时间冲突的事件（含事件 #${e.id}）`
+        `设备 #${e.equipment_id} 在 ${e.event_time} 存在时间冲突的事件（含事件 #${e.id}）：` +
+        '同一设备同一时刻只能有一条事件（分钟写法与带秒写法按同一时刻判定）'
       );
     }
     slot.add(key);
   }
 
   // 3. 加工引用此前产出的批次：禁止引用未来批次、禁止形成循环
-  //    以“批次由其加工事件的时间定义先后”，构造批次依赖图。
-  const batchTime = new Map();          // batchId -> ISO 时间
+  //    以“批次由其加工事件的实际时刻定义先后”，构造批次依赖图。
+  //    分钟写法与带秒写法按同一实际时刻判定（同刻引用不属“严格更早”，拒绝）。
+  const batchTime = new Map();          // batchId -> 实际时刻（补秒后的定长串）
   const batchEvent = new Map();         // batchId -> eventId
   for (const [bid, eid] of batchProducer.entries()) {
     const ev = events.find((x) => x.id === eid);
-    batchTime.set(bid, ev.event_time);
+    batchTime.set(bid, ev._t);
     batchEvent.set(bid, eid);
   }
 
@@ -71,8 +80,13 @@ function validateAll(db) {
     const tProducer = batchTime.get(ev.batch_id);
     const tRef = batchTime.get(row.ref_batch);
     if (tRef >= tProducer) {
+      const producerEv = eventById.get(batchEvent.get(ev.batch_id));
+      const refEv = eventById.get(batchEvent.get(row.ref_batch));
+      const sameMoment = tRef === tProducer;
       errors.push(
-        `事件 #${ev.id}（${tProducer}）引用了未来或同时刻批次 #${row.ref_batch}（产出时间 ${tRef}），不允许引用未来批次`
+        `事件 #${ev.id}（${producerEv ? producerEv.event_time : tProducer}）引用了${sameMoment ? '同时刻' : '未来'}批次 #${row.ref_batch}` +
+        `（产出时间 ${refEv ? refEv.event_time : tRef}），不允许引用未来批次` +
+        (sameMoment ? '；引用批次必须严格更早产出（分钟写法与带秒写法按同一时刻判定）' : '')
       );
     }
     if (!edges.has(ev.batch_id)) edges.set(ev.batch_id, new Set());

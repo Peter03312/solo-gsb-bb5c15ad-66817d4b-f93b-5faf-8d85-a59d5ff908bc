@@ -10,8 +10,21 @@
 // 集合不同的有效放行置为失效并记录原因；
 // 进而永久停用不再一致的标签卷，并把分配过这些停用卷的出货单置为待评估。
 
+const { normTime } = require('./timeutil');
+
 const MAX_PATHS_PER_ALLERGEN = 30;
 const TRUNC_MARK = '…（来源路径过多，已截断）';
+
+// 按实际时刻排列事件：分钟写法（09:00）与带秒写法（09:00:00）为同一刻，
+// SQL 字符串排序会把二者错置先后，这里统一按补秒后的实际时刻排序、id 兜底。
+function loadEventsByInstant(db) {
+  return db.prepare(
+    `SELECT id, event_time, type, equipment_id, batch_id, note, clean_allergens
+       FROM events ORDER BY event_time, id`
+  ).all()
+    .map((e) => ({ ...e, _t: normTime(e.event_time) }))
+    .sort((a, b) => (a._t < b._t ? -1 : a._t > b._t ? 1 : a.id - b.id));
+}
 
 function sortedJson(arr) {
   return JSON.stringify([...new Set(arr)].sort((a, b) => a.localeCompare(b, 'zh')));
@@ -48,10 +61,7 @@ function replayTimeline(db, ctx = {}) {
     db.prepare('SELECT id, code, name FROM equipment').all().map((q) => [q.id, q])
   );
 
-  const events = db.prepare(
-    `SELECT id, event_time, type, equipment_id, batch_id, note, clean_allergens
-       FROM events ORDER BY event_time, id`
-  ).all();
+  const events = loadEventsByInstant(db);
 
   const inputsByEvent = new Map();
   db.prepare('SELECT event_id, material_id, batch_id FROM process_inputs').all()
@@ -266,4 +276,10 @@ function recompute(db) {
   };
 }
 
-module.exports = { recompute, replayTimeline, sortedJson, cleanScopeOf };
+module.exports = {
+  recompute,
+  replayTimeline,
+  sortedJson,
+  cleanScopeOf,
+  loadEventsByInstant
+};

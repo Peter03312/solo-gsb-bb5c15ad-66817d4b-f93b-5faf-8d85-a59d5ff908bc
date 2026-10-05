@@ -221,7 +221,8 @@
       </div>
       <div class="form-row">
         <label>时间 <span class="req">*</span></label>
-        <input type="datetime-local" name="event_time" required>
+        <!-- step=1：允许带秒写法；既有分钟写法与带秒写法按同一实际时刻判定。 -->
+        <input type="datetime-local" name="event_time" step="1" required>
       </div>
       <div class="form-row">
         <label>设备 <span class="req">*</span></label>

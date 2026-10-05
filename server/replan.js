@@ -27,6 +27,7 @@ const Database = require('better-sqlite3');
 const { initSchema } = require('./db');
 const { validateAll } = require('./validation');
 const { recompute } = require('./recompute');
+const { normTime } = require('./timeutil');
 
 const PREVIEW_TTL_MS = 30 * 60 * 1000; // 预演版本有效期 30 分钟
 const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
@@ -264,12 +265,15 @@ function parseCleanAllergens(raw, where, errors) {
 }
 
 // 规范化排序：与提交顺序无关，保证“相同变更内容”哈希一致。
+// 拟插入清洗的次序键按实际时刻（分钟/带秒写法同刻），避免同刻异写导致哈希漂移。
 function canonicalOrder(changes) {
   return changes.slice().sort((a, b) => {
     if (a.op !== b.op) return a.op < b.op ? -1 : 1;
     if (a.op === 'update') return a.event_id - b.event_id;
-    const ka = a.client_key || `${a.event_time}|${a.equipment_id}|${a.note}`;
-    const kb = b.client_key || `${b.event_time}|${b.equipment_id}|${b.note}`;
+    const ka = a.client_key
+      || `${normTime(a.event_time)}|${a.equipment_id}|${a.note}`;
+    const kb = b.client_key
+      || `${normTime(b.event_time)}|${b.equipment_id}|${b.note}`;
     return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
 }
@@ -450,12 +454,18 @@ function takeSnapshot(db) {
     last_cleaned_at: e.last_cleaned_at || null
   }));
 
-  // 最近一次 CLEAN 事件的清洗范围（null=全清）按设备回放，供差异展示“变化依据”。
+  // 最近一次 CLEAN 事件的清洗范围（null=全清）按设备按实际时刻回放，供差异展示“变化依据”。
   const lastScope = new Map();
   db.prepare(
-    `SELECT equipment_id, clean_allergens FROM events
+    `SELECT equipment_id, clean_allergens, event_time FROM events
       WHERE type = 'CLEAN' ORDER BY event_time, id`
-  ).all().forEach((c) => lastScope.set(c.equipment_id, c.clean_allergens));
+  ).all()
+    .slice()
+    .sort((a, b) => {
+      const ta = normTime(a.event_time), tb = normTime(b.event_time);
+      return ta < tb ? -1 : ta > tb ? 1 : a.id - b.id;
+    })
+    .forEach((c) => lastScope.set(c.equipment_id, c.clean_allergens));
   for (const [qid, r] of residues) r.last_clean_allergens = lastScope.get(qid) == null
     ? null : JSON.parse(lastScope.get(qid));
 

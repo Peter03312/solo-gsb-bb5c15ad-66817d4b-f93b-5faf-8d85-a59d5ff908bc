@@ -25,6 +25,9 @@ const DEFAULT_PATH_LIMIT = 30;
 const MAX_PATHS = 200;
 const TRUNC_MARK = '…（传播路径过多，已截断，受影响对象本身不受截断影响）';
 
+// 与推导引擎共用“按实际时刻排列事件”（分钟/带秒写法同刻，id 兜底）。
+const { loadEventsByInstant } = require('./recompute');
+
 // 无过敏原原料（如食用盐）在设备传播中的“空过敏原标签”：部分清洗无法覆盖该标签，
 // 只有全清会清除其设备传播。
 const NO_ALLERGEN_TAG = ' __NO_ALLERGEN__';
@@ -139,10 +142,9 @@ function traceMaterial(db, options) {
   const equipment = new Map(
     db.prepare('SELECT id, code, name FROM equipment').all().map((q) => [q.id, q])
   );
-  const events = db.prepare(
-    `SELECT id, event_time, type, equipment_id, batch_id, clean_allergens
-       FROM events ORDER BY event_time, id`
-  ).all();
+  // 按实际时刻回放（分钟写法与带秒写法同刻；直接用 SQL 字符串排序会错置两种写法的先后）。
+  // loadEventsByInstant 选取的列为本查询所需列的超集（多出 note），无影响。
+  const events = loadEventsByInstant(db);
   const inputsByEvent = new Map();
   db.prepare(
     `SELECT event_id, material_id, batch_id AS ref_batch_id, material_lot_id

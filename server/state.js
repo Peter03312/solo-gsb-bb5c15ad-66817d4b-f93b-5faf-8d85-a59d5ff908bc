@@ -14,6 +14,7 @@
 // 缺数量时仍按原形状返回，分组均按主键/外键精确归位，不混入其他卷或批次的数据。
 
 const { replayTimeline } = require('./recompute');
+const { eventsByInstant, normTime } = require('./timeutil');
 const labels = require('./labels');
 const shipments = require('./shipments');
 const quarantine = require('./quarantine');
@@ -141,7 +142,9 @@ function getFullState(db) {
     }
 
     // ---- 事件及其原料输入（一次取全输入并按事件分组；按 event_id,id 保证逐笔顺序）----
-    const eventRows = db.prepare(
+    // 排序按实际时刻：分钟写法 09:00 与带秒写法 09:00:00 同刻（id 兜底），
+    // 不直接依赖 SQL 字符串排序。
+    const eventRows = eventsByInstant(db.prepare(
       `SELECT ev.id, ev.event_time, ev.type, ev.equipment_id, ev.note,
               ev.clean_allergens,
               ev.batch_id, b.code AS batch_code,
@@ -151,7 +154,7 @@ function getFullState(db) {
          LEFT JOIN batches b ON b.id = ev.batch_id
          LEFT JOIN batch_outputs bo ON bo.batch_id = ev.batch_id
         ORDER BY ev.event_time, ev.id`
-    ).all();
+    ).all());
     const inputsByEvent = new Map();
     db.prepare(
       `SELECT pi.id AS pi_id, pi.event_id, pi.material_id, pi.batch_id AS ref_batch_id,
@@ -206,7 +209,8 @@ function getFullState(db) {
       }))
     }));
 
-    // ---- 批次 + 放行（放行一次取全并按批次分组；批次排序保持 produced_at、code）----
+    // ---- 批次 + 放行（放行一次取全并按批次分组；批次按产出实际时刻、code 排序）----
+    // produced_at 用事件原文展示，排序按补秒后的实际时刻（分钟/带秒写法同刻）。
     const batchRows = db.prepare(
       `SELECT b.id, b.code, bo.allergens, bo.paths_json,
               ev.event_time AS produced_at, ev.equipment_id, eq.code AS equipment_code, eq.name AS equipment_name
@@ -215,7 +219,18 @@ function getFullState(db) {
          LEFT JOIN events ev ON ev.batch_id = b.id
          LEFT JOIN equipment eq ON eq.id = ev.equipment_id
         ORDER BY ev.event_time, b.code`
-    ).all();
+    ).all()
+      .sort((a, b) => {
+        // 无加工事件的批次（数据异常兜底）produced_at 为 null，排在最后。
+        if (a.produced_at == null && b.produced_at == null) {
+          return a.code < b.code ? -1 : a.code > b.code ? 1 : 0;
+        }
+        if (a.produced_at == null) return 1;
+        if (b.produced_at == null) return -1;
+        const ta = normTime(a.produced_at), tb = normTime(b.produced_at);
+        if (ta !== tb) return ta < tb ? -1 : 1;
+        return a.code < b.code ? -1 : a.code > b.code ? 1 : 0;
+      });
     const releasesByBatch = new Map();
     db.prepare(
       `SELECT id, batch_id, released_at, released_by, snapshot_allergens, status, invalid_reason

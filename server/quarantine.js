@@ -19,6 +19,7 @@
 // 批号的 FLAGGED 异常标记仍只作留痕，与隔离令互不影响。
 
 const { traceMaterial } = require('./trace');
+const { normTime } = require('./timeutil');
 
 const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
 
@@ -406,8 +407,20 @@ function shipmentBriefs(db, batchId) {
   });
 }
 
+// 范围批次排序：按产出实际时刻（分钟/带秒写法同刻），其次 batch_id。
+function sortScopeRows(rows) {
+  return rows.slice().sort((a, b) => {
+    const ta = a.produced_at == null ? null : normTime(a.produced_at);
+    const tb = b.produced_at == null ? null : normTime(b.produced_at);
+    if (ta === tb) return a.batch_id - b.batch_id;
+    if (ta == null) return 1;
+    if (tb == null) return -1;
+    return ta < tb ? -1 : 1;
+  });
+}
+
 function scopeBatches(db, orderId, { withEvidence }) {
-  const rows = db.prepare(
+  const rows = sortScopeRows(db.prepare(
     `SELECT qs.batch_id, qs.classification, qs.evidence_json,
             b.code AS batch_code, ev.event_time AS produced_at, eq.code AS equipment_code
        FROM quarantine_scope qs
@@ -416,7 +429,7 @@ function scopeBatches(db, orderId, { withEvidence }) {
        LEFT JOIN equipment eq ON eq.id = ev.equipment_id
       WHERE qs.order_id = ?
       ORDER BY ev.event_time, qs.batch_id`
-  ).all(orderId);
+  ).all(orderId));
   return rows.map((r) => {
     const base = {
       batch_id: r.batch_id,
@@ -537,7 +550,7 @@ function scopeBatchesBulk(db, orderIds) {
   const byOrder = new Map();
   if (!orderIds.length) return byOrder;
   const placeholders = orderIds.map(() => '?').join(',');
-  const rows = db.prepare(
+  const rows = sortScopeRows(db.prepare(
     `SELECT qs.order_id, qs.batch_id, qs.classification,
             b.code AS batch_code, ev.event_time AS produced_at, eq.code AS equipment_code
        FROM quarantine_scope qs
@@ -546,7 +559,7 @@ function scopeBatchesBulk(db, orderIds) {
        LEFT JOIN equipment eq ON eq.id = ev.equipment_id
       WHERE qs.order_id IN (${placeholders})
       ORDER BY ev.event_time, qs.batch_id`
-  ).all(...orderIds);
+  ).all(...orderIds));
   for (const r of rows) {
     if (!byOrder.has(r.order_id)) byOrder.set(r.order_id, []);
     byOrder.get(r.order_id).push({

@@ -1,16 +1,15 @@
 'use strict';
 const Database = require('better-sqlite3');
+const { initSchema } = require('../server/db');
 const { validateAll } = require('../server/validation');
 
+// 与正式库同一套表结构（initSchema 建空表），仅插入校验所需的设备，
+// 避免手写最小夹具随全量校验新增核对项（库存/停机窗口等）反复缺表缺列。
 function memDb() {
   const db = new Database(':memory:');
   db.pragma('foreign_keys=ON');
-  db.exec(`CREATE TABLE equipment(id INTEGER PRIMARY KEY);
-    CREATE TABLE batches(id INTEGER PRIMARY KEY, code TEXT);
-    CREATE TABLE events(id INTEGER PRIMARY KEY, event_time TEXT, type TEXT, equipment_id INTEGER, batch_id INTEGER);
-    CREATE TABLE process_inputs(id INTEGER PRIMARY KEY, event_id INTEGER, material_id INTEGER, batch_id INTEGER);
-    CREATE TABLE equipment_downtime_windows(id INTEGER PRIMARY KEY, equipment_id INTEGER, start_time TEXT, end_time TEXT, reason TEXT, operator TEXT);`);
-  db.prepare('INSERT INTO equipment(id) VALUES (1),(2)').run();
+  initSchema(db);
+  db.prepare('INSERT INTO equipment(id,code,name) VALUES (1,\'E1\',\'设备1\'),(2,\'E2\',\'设备2\')').run();
   return db;
 }
 

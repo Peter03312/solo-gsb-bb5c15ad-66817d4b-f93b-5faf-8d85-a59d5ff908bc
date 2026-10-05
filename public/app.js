@@ -640,7 +640,9 @@ window.editEvent = function (id) {
   $('#eventModalTitle').textContent = `更正事件 #${id}（${ev.type === 'PROCESS' ? '加工' : '已核实清洗'}）`;
   const form = $('#eventForm');
   form.type.value = ev.type;
-  form.event_time.value = ev.event_time.length === 16 ? ev.event_time : ev.event_time.slice(0, 16);
+  // 回填保留原时间文本（含带秒写法；datetime-local 值以 T 分隔，step=1 时可含秒）：
+  // 不能截断秒，否则更正其它字段时会把 09:00:00 悄悄改写为 09:00 提交。
+  form.event_time.value = ev.event_time;
   form.note.value = ev.note || '';
   form.batch_code.value = ev.batch_code || '';
   $('#processFields').style.display = ev.type === 'PROCESS' ? 'block' : 'none';

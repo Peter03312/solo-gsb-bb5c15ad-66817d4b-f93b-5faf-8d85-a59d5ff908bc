@@ -65,6 +65,9 @@
 - 批次引用关系**形成循环**被拒绝。
 - **同一设备同一时刻**存在多条事件（时间冲突）被拒绝。
 - 同一批次不能被两次加工产出。
+- 时间文本同时接受**分钟写法 `2026-10-01T09:00`** 与**带秒写法 `2026-10-01T09:00:00`**：
+  冲突与先后一律按**实际时刻**判定（两者为同一刻），原文写法则原样保留在事件中。详见下文
+  [“时间写法与实际时刻判定”](#时间写法与实际时刻判定本轮修复)。
 
 ### 部分清洗（CLEAN 事件携带已核实去除过敏原集合）
 
@@ -385,6 +388,93 @@ curl -s -X POST http://localhost:3000/api/replan/apply \
 > 确认应用结果与重新预演逐项一致。
 
 端到端测试：`npm run test:replan-label-rolls`。
+
+端到端测试：`npm run test:replan-label-rolls`。
+
+## 时间写法与实际时刻判定（本轮修复）
+
+事件时间文本一直允许两种写法，且写入后**原文保留**（接口回显、台账、对账均显示提交时的字符串）：
+
+- **分钟写法**：`2026-10-01T09:00`
+- **带秒写法**：`2026-10-01T09:00:00`
+
+二者表示**同一实际时刻**（分钟写法即该分钟的 00 秒）。此前冲突与引用先后直接按文本字符串判断，
+导致 `09:00` 的加工与 `09:00:00` 的清洗虽同刻却被同时接受；两个批次分别使用两种写法时，
+同刻引用也会被误认为“严格更早”，使设备残留推导与放行依据失真。本轮起，所有时间判断统一以
+解析后的**实际时刻**为准（服务端新增 `server/timeutil.js`，分钟写法补秒后比较）：
+
+- **同设备冲突**：同一设备上同一实际时刻只允许一条事件——`09:00` 与 `09:00:00` 同刻即冲突，
+  单条事件新增/更正、断网整包补录、换线预演与确认四条路径整次拒绝；**同刻但不同设备允许**。
+- **批次引用先后**：引用批次的产出时刻必须**严格更早**；同刻（无论写法是否相同）一律拒绝，
+  错误信息区分为“同时刻/未来”。
+- **时间线回放与展示**：推导引擎、批号追溯、`GET /api/state` 的事件/批次列表、隔离令范围清单，
+  均按实际时刻排序（同刻以事件 id 兜底），不再受两种写法的字符串次序影响。
+- **停机窗口**沿用同一归一化口径（`[起点, 终点)` 左闭右开），分钟与带秒写法混用时同样按实际时刻命中。
+
+事务语义不变：**非法变更整次拒绝**——事件、设备残留、放行快照、标签卷与出货等已产生的业务结论
+一律保持原样；**合法的异时刻变更**仍按既有规则全量重算并联动放行失效、停卷、待评估与隔离刷新。
+补录**同号同内容重试**（原样幂等返回）与**预演版本令牌**（`version` 30 分钟有效、确认须原样回传
+changes）等既定约定均保持不变。前端事件弹窗时间框已支持到秒（`step=1`），更正带秒事件时回填
+完整原文，不会再把 `09:00:00` 截断成 `09:00`。
+
+### 调用示例（curl）
+
+```bash
+# 1) 加工：分钟写法（两种写法继续都可用，原文保留）
+curl -s -X POST http://localhost:3000/api/events \
+  -H 'Content-Type: application/json' -d '{
+    "type":"PROCESS","event_time":"2026-10-01T09:00","equipment_id":1,
+    "batch_code":"B-1001","material_ids":[3] }'
+# -> { id:10, invalidated:[], ... }
+
+# 2) 同设备同刻但用带秒写法再记清洗 -> 整次拒绝（旧逻辑会误放行）
+curl -s -X POST http://localhost:3000/api/events \
+  -H 'Content-Type: application/json' -d '{
+    "type":"CLEAN","event_time":"2026-10-01T09:00:00","equipment_id":1,"note":"同刻清洗" }'
+# -> 400 { error:"提交被拒绝（整次提交已回滚）",
+#         details:["设备 #1 在 2026-10-01T09:00:00 存在时间冲突的事件（含事件 #11）：
+#                  同一设备同一时刻只能有一条事件（分钟写法与带秒写法按同一时刻判定）"] }
+
+# 3) 另一批次在 09:00:00 引用 09:00 产出的批次 #6 -> 同刻引用拒绝
+curl -s -X POST http://localhost:3000/api/events \
+  -H 'Content-Type: application/json' -d '{
+    "type":"PROCESS","event_time":"2026-10-01T09:00:00","equipment_id":2,
+    "batch_code":"B-1002","material_ids":[3],"ref_batch_ids":[6] }'
+# -> 400 { details:["事件 #11（2026-10-01T09:00:00）引用了同时刻批次 #6（产出时间
+#          2026-10-01T09:00），不允许引用未来批次；引用批次必须严格更早产出
+#         （分钟写法与带秒写法按同一时刻判定）"] }
+
+# 4) 晚 1 秒的异时刻引用合法，按原规则推导（引用批次的过敏原并入产出）
+curl -s -X POST http://localhost:3000/api/events \
+  -H 'Content-Type: application/json' -d '{
+    "type":"PROCESS","event_time":"2026-10-01T09:00:01","equipment_id":2,
+    "batch_code":"B-1003","material_ids":[4],"ref_batch_ids":[6] }'
+# -> { id:11, ... }
+
+# 5) 断网整包补录：包内同刻引用整包回滚（不写事件、不写补录台账）
+curl -s -X POST http://localhost:3000/api/backfills \
+  -H 'Content-Type: application/json' -d '{
+    "backfill_code":"BF-20261002-1",
+    "records":[
+      {"external_ref":"R1","type":"PROCESS","event_time":"2026-10-02T08:00",
+       "equipment_id":1,"batch_code":"BF-1","material_ids":[3]},
+      {"external_ref":"R2","type":"PROCESS","event_time":"2026-10-02T08:00:00",
+       "equipment_id":2,"batch_code":"BF-2","material_ids":[4],
+       "ref_batch_codes":["BF-1"]} ] }'
+# -> 400 BACKFILL_REJECTED，details:["records[1]…引用的包内批次 \"BF-1\" 产出时间
+#    2026-10-02T08:00 不严格早于本条 2026-10-02T08:00:00（两时间为同一实际时刻…）"]
+
+# 6) 换线预演：把既有事件改成与同设备另一事件同刻（异写）-> 预演拒绝、不写正式数据
+curl -s -X POST http://localhost:3000/api/replan/preview \
+  -H 'Content-Type: application/json' -d '{
+    "changes":[{"op":"update","event_id":10,"type":"PROCESS",
+      "event_time":"2026-09-30T09:00:00","equipment_id":1,
+      "batch_code":"B-1001","material_ids":[3]}] }'
+# -> 400 REPLAN_REJECTED，details 含“存在时间冲突的事件…”
+# 合法的异时刻预演照常返回 version，再 POST /api/replan/apply（原样回传 version+changes）确认。
+```
+
+端到端测试：`npm run test:time-instants`（四条路径 + 文本保留/幂等/合法变更重算，共 30+ 项断言）。
 
 ## 过敏原标签卷（包装前登记 → 核销贴用/作废）
 
@@ -1799,6 +1889,7 @@ server/
   quarantine.js  # 质量隔离令：签发/解除（原因/操作人/时间留痕，同批号同时一张生效令）；按当前时间线批号流向确定生效范围（确定命中+批号未知无法排除，含传播依据）并随重算同步刷新；受控批次禁放行/禁登记卷/禁出货、已有卷暂停贴用（不永久停用）、关联出货单转待评估、有效继续流转结论转需重评、隔离期间只能召回；脱离所有生效令后恢复
   inventory.js   # 批号库存计量（克）：期初实物结存（每批号一次、非负整数）、入库流水（唯一单号、正整数、只增不改）；按批号累计领用≤期初+入库的写入侧校验与最终状态全量校验；台账（期初/入库/领用/可用量/未计量旧输入数）
   replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号与克数；预演 diff.lot_inventory 只展示批号余额差异不占用库存）
+  timeutil.js    # 事件时间文本归一化：分钟写法 09:00 与带秒 09:00:00 按同一实际时刻比较/排序（同设备冲突、批次引用先后、回放与停机窗口共用）
   seed.js        # 首次启动演示数据（含供应批号、同原料多批号投料、一卷演示标签卷与一张演示出货单、两个相邻检修停机窗口）
   server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions、/api/backfills 补录与对账、/api/downtime-windows 停机窗口、/api/quarantine-orders 质量隔离令、/api/material-lots/:id/opening-balance|inbound|inventory 与 /api/lot-inventory 批号库存计量）
 public/
@@ -1815,5 +1906,6 @@ scripts/
   test-downtime.js   # 设备检修停机窗口：登记/调整/取消/查询、重叠与相邻、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗 端到端测试
   test-quarantine.js # 质量隔离令：签发/解除/重复拒绝、生效范围与传播依据、受控约束、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复 端到端测试
   test-inventory.js  # 批号库存计量（克）：期初/入库/非法与重复拒绝、必填正整数克数与累计领用余额、旧输入补量、更正删除补录换线同事务重算与预演不占用、重试复用不重复领用、台账查询 端到端测试
+  test-time-instants.js # 时间写法按实际时刻判定：同设备同刻异写冲突/同刻引用拒绝（单条新增更正、断网补录、换线预演确认）、异时合法变更重算、原文保留、补录幂等与预演版本约定 端到端测试
 Dockerfile  docker-compose.yml
 ```
