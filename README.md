@@ -61,9 +61,12 @@
 
 ### 提交约束（整次提交事务化，违反任意一条则整单回滚拒绝）
 
-- 加工只能引用**产出时间严格更早**的批次——引用未来批次被拒绝。
+- 加工只能引用**产出时间严格更早**的批次——引用未来批次被拒绝
+  （先后按**实际时刻**判定：分钟写法 `09:00` 与带秒写法 `09:00:00` 表示同一时刻时视为同刻，
+  同刻不算严格更早；详见「事件时间按实际时刻判定」）。
 - 批次引用关系**形成循环**被拒绝。
-- **同一设备同一时刻**存在多条事件（时间冲突）被拒绝。
+- **同一设备同一时刻**存在多条事件（时间冲突）被拒绝
+  （同刻按**实际时刻**判定，分钟/带秒两种写法等价）。
 - 同一批次不能被两次加工产出。
 
 ### 部分清洗（CLEAN 事件携带已核实去除过敏原集合）
@@ -1670,6 +1673,97 @@ curl -s http://localhost:3000/api/downtime-windows
 > 启动方式保持不变：`npm start`（本地）或 `docker compose up --build -d`（容器），
 > 首次启动按 `SEED_DEMO` 决定是否写入演示数据；读优化只影响服务端取数，不改变建库、
 > 播种与任何写入接口。
+
+## 事件时间按实际时刻判定：分钟与带秒写法等价（本轮修复）
+
+事件时间一直接受两种本地 ISO 写法（均无时区）：**分钟写法** `2026-10-01T09:00` 与
+**带秒写法** `2026-10-01T09:00:00`。两种写法可表示**同一实际时刻**，但此前校验按原始
+文本比较：同一设备先以 `2026-10-01T09:00` 记录加工、再以 `2026-10-01T09:00:00` 记录清洗，
+会被误判为不同时刻而接受（同设备同刻冲突漏判）；两个批次分别使用这两种写法时，
+**同刻引用也会被误判为“严格更早”**，使设备残留与放行依据失真。本轮修复后，
+**同设备时间冲突与批次引用先后一律按实际时刻判定**：
+
+- **既有写法继续可用**：分钟写法与带秒写法均可用于新增/更正/补录/换线；
+  事件时间的存储与展示**保留提交的原始文本**（`09:00` 仍显示 `09:00`，
+  `09:00:00` 仍显示 `09:00:00`），只有比较判定统一按实际时刻。
+- **同设备冲突按实际时刻**：同一设备上 `09:00` 与 `09:00:00` 即同一时刻，
+  存在多条事件整次拒绝；`09:00` 与 `09:00:30`、`09:01` 等不同时刻不受影响。
+- **批次引用按实际时刻严格更早**：被引用批次的产出时刻与本事件同刻（无论写法）即拒绝
+  （提示“引用了未来或同时刻批次 … 不允许引用未来批次”）；只有实际时刻严格更早才允许引用。
+- **覆盖全部写入口径**：单条事件新增/更正（`POST/PUT /api/events`）、断网整包补录
+  （`POST /api/backfills`，含包内记录之间的引用先后）、换线整组预演与确认
+  （`POST /api/replan/preview`、`POST /api/replan/apply`）均按同一口径判定；
+  设备检修停机窗口的左闭右开核对此前已按实际时刻，现与上述判定共用同一比较模块。
+- **非法变更整次拒绝**：事务回滚，不写入事件，也不改变已产生的推导、放行、标签卷、
+  出货与处置结论；**合法异时变更仍按原规则全量重算**并联动放行失效、标签卷停用等。
+- **既定约定不变**：补录同号同内容重试仍幂等返回原结果；换线预演版本（签名、30 分钟
+  有效期、拟插入编号一致性、过期语义）与各接口响应形状均不变，无新增错误码。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/events` / `PUT /api/events/:id` | `event_time` 分钟/带秒写法均可；同设备同刻（按实际时刻）冲突或同刻引用批次 → 400 整次回滚（`details` 逐条中文原因） |
+| `POST /api/backfills` | 包内记录同设备同刻、包内引用同刻产出、或与既有事件同刻冲突/同刻引用 → 400 `BACKFILL_REJECTED`（整包回滚，不写事件与台账）；同号同内容重试仍幂等 |
+| `POST /api/replan/preview` / `POST /api/replan/apply` | 整组变更后同设备同刻冲突或同刻引用 → 400 `REPLAN_REJECTED`（预演不写正式数据；确认不落库、不占事件编号）；版本与编号语义不变 |
+
+### 调用示例（curl，基于演示数据）
+
+演示库中 `LINE-A`（设备 #1）已有 `2026-09-30T09:00` 的清洗事件（#2），
+`BATCH-001`（批次 #1）由 `2026-09-30T08:00` 的加工事件（#1）产出。
+
+```bash
+# 1) 同设备同刻（分钟 vs 带秒）：以带秒写法在同刻新增加工 -> 400 整次拒绝（不写事件）
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' -d '{
+  "type":"PROCESS","event_time":"2026-09-30T09:00:00","equipment_id":1,
+  "batch_code":"BATCH-X","material_ids":[1]}'
+# -> { "error":"提交被拒绝（整次提交已回滚）",
+#      "details":["设备 #1 存在时间冲突的事件：事件 #2（2026-09-30T09:00）与
+#                  事件 #…（2026-09-30T09:00:00）实际时刻相同，…"] }
+
+# 2) 同刻引用（两种写法）：BATCH-001 产出时间为 2026-09-30T08:00；
+#    以带秒写法同刻加工并引用它 -> 400（同刻不算“严格更早”）
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' -d '{
+  "type":"PROCESS","event_time":"2026-09-30T08:00:00","equipment_id":2,
+  "batch_code":"BATCH-Y","material_ids":[],"ref_batch_ids":[1]}'
+# -> details 含“引用了未来或同时刻批次 #1（产出时间 2026-09-30T08:00），不允许引用未来批次”
+
+# 3) 合法异时：带秒写法 08:00:30 引用 08:00 产出的 BATCH-001 -> 正常受理并按原规则重算
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' -d '{
+  "type":"PROCESS","event_time":"2026-09-30T08:00:30","equipment_id":2,
+  "batch_code":"BATCH-Y","material_ids":[],"ref_batch_ids":[1]}'
+# -> { "id":…, "invalidated":[…], "retired_rolls":[…], … }（响应形状不变）
+
+# 4) 断网补录：包内两条记录同设备同刻（两种写法）-> 400 BACKFILL_REJECTED，整包回滚
+curl -s -X POST http://localhost:3000/api/backfills -H 'Content-Type: application/json' -d '{
+  "backfill_code":"BF-20261001-A",
+  "records":[
+    {"external_ref":"L-1","type":"CLEAN","event_time":"2026-10-01T09:00","equipment_id":1},
+    {"external_ref":"L-2","type":"PROCESS","event_time":"2026-10-01T09:00:00","equipment_id":1,
+     "batch_code":"BATCH-Z","material_ids":[1]}
+  ]}'
+# -> { "error":"补录包应用后的时间线校验未通过（整包回滚，不留部分事件）",
+#      "code":"BACKFILL_REJECTED", "details":["设备 #1 存在时间冲突的事件：…"] }
+
+# 5) 换线预演：拟插入清洗与既有清洗同刻（带秒写法）-> 400 REPLAN_REJECTED（不写正式数据）
+curl -s -X POST http://localhost:3000/api/replan/preview -H 'Content-Type: application/json' -d '{
+  "changes":[{"op":"insert_clean","event_time":"2026-09-30T09:00:00","equipment_id":1}]}'
+# -> { "error":"整组变更应用后的时间线校验未通过", "code":"REPLAN_REJECTED",
+#      "details":["设备 #1 存在时间冲突的事件：…"] }
+
+# 6) 读取状态：既有事件时间文本原样保留（分钟/带秒各按提交时的写法展示）
+curl -s http://localhost:3000/api/state | node -e 'let d="";process.stdin.on("data",c=>d+=c)
+  .on("end",()=>{for(const e of JSON.parse(d).events) console.log(e.id, e.type, e.event_time);})'
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 同设备同刻冲突 / 同刻引用批次（单条事件新增/更正） | 400 | （原 VALIDATION_FAILED 形状：`error` + `details`） |
+| 补录包同刻冲突 / 包内或引用既有批次的同刻引用 | 400 | `BACKFILL_REJECTED` |
+| 换线整组后同刻冲突 / 同刻引用 | 400 | `REPLAN_REJECTED` |
+| 时间格式非法（非分钟/带秒写法） | 400 | 沿用各接口原语义 |
+
+端到端测试：`npm run test:time-instants`。
 
 ## 一键启动（Docker，从空环境开始）
 

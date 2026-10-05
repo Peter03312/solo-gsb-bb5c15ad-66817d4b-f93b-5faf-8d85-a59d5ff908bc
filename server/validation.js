@@ -3,6 +3,7 @@
 // 返回错误信息数组（中文），为空表示通过。校验失败时调用方回滚整次提交。
 
 const { collectWindowConflicts } = require('./downtime');
+const { normTime } = require('./timeutil');
 
 function validateAll(db) {
   const errors = [];
@@ -29,16 +30,21 @@ function validateAll(db) {
     }
   }
 
-  // 2. 同一设备事件时间冲突（同一设备不允许同一时刻多条事件）
-  const slot = new Set();
+  // 2. 同一设备事件时间冲突（同一设备不允许同一时刻多条事件）。
+  //    按实际时刻判定：分钟写法与带秒写法表示同一时刻（如 09:00 与 09:00:00）即冲突；
+  //    错误信息中保留各事件原始时间文本。
+  const slot = new Map();           // equipment_id|实际时刻 -> 首条事件
   for (const e of events) {
-    const key = `${e.equipment_id}|${e.event_time}`;
-    if (slot.has(key)) {
+    const key = `${e.equipment_id}|${normTime(e.event_time)}`;
+    const first = slot.get(key);
+    if (first) {
       errors.push(
-        `设备 #${e.equipment_id} 在 ${e.event_time} 存在时间冲突的事件（含事件 #${e.id}）`
+        `设备 #${e.equipment_id} 存在时间冲突的事件：事件 #${first.id}（${first.event_time}）与 ` +
+        `事件 #${e.id}（${e.event_time}）实际时刻相同，同一设备同一时刻只允许一条事件`
       );
+    } else {
+      slot.set(key, e);
     }
-    slot.add(key);
   }
 
   // 3. 加工引用此前产出的批次：禁止引用未来批次、禁止形成循环
@@ -70,7 +76,8 @@ function validateAll(db) {
     }
     const tProducer = batchTime.get(ev.batch_id);
     const tRef = batchTime.get(row.ref_batch);
-    if (tRef >= tProducer) {
+    // 按实际时刻判定“严格更早”：同刻（含分钟/带秒两种写法表示同一时刻）即拒绝。
+    if (normTime(tRef) >= normTime(tProducer)) {
       errors.push(
         `事件 #${ev.id}（${tProducer}）引用了未来或同时刻批次 #${row.ref_batch}（产出时间 ${tRef}），不允许引用未来批次`
       );

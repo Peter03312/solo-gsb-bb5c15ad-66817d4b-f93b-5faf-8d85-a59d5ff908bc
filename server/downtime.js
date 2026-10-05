@@ -11,6 +11,8 @@
 //   - 停机不等于清洗：窗口不是事件，不改变设备残留或过敏原推导，不触发重算联动。
 
 const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
+// 窗口与事件时间统一按实际时刻比较（分钟写法补足 ":00" 后按字符串比较，同构可比）。
+const { normTime } = require('./timeutil');
 
 class DowntimeError extends Error {
   constructor(code, message, details, conflicts) {
@@ -20,11 +22,6 @@ class DowntimeError extends Error {
     this.details = details || [];
     this.conflicts = conflicts || [];
   }
-}
-
-// 统一为含秒的形式再按字符串比较（事件时间与窗口时间均为本地 ISO 串，同构可比）。
-function normTime(t) {
-  return String(t).length === 16 ? `${t}:00` : String(t);
 }
 
 // ---------- 请求体规范化（设备/起止/原因/操作人） ----------
